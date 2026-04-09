@@ -56,6 +56,9 @@ HALF_SELL_THRESHOLD  = 0.03   # 跌破短線 3%
 FULL_SELL_THRESHOLD  = 0.03   # 跌破長線 3%
 INITIAL_CAPITAL = 500      # 初始資金 (USD)
 
+VIRTUAL_STATE_FILE = "virtual_state.json"
+TRADE_LOG_FILE     = "trade_log.csv"
+
 # ─────────────────────────────────────────
 # 2. 取得歷史資料（Coinbase Advanced API）
 # ─────────────────────────────────────────
@@ -291,7 +294,34 @@ def get_live_signal(product_id: str = "BTC-USD") -> dict:
     }
 
 # ─────────────────────────────────────────
-# 6. Coinbase API 交易執行
+# 6. 輔助功能：虛擬帳戶與日誌
+# ─────────────────────────────────────────
+def load_virtual_state():
+    """載入虛擬帳戶狀態 (USD & BTC)"""
+    if os.path.exists(VIRTUAL_STATE_FILE):
+        with open(VIRTUAL_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"usd": float(INITIAL_CAPITAL), "btc": 0.0}
+
+def save_virtual_state(usd, btc):
+    """儲存虛擬帳戶狀態"""
+    with open(VIRTUAL_STATE_FILE, "w") as f:
+        json.dump({"usd": round(usd, 2), "btc": round(btc, 6)}, f)
+
+def append_to_log(action, price, qty, balance_usd, reason):
+    """將交易紀錄寫入 CSV 日誌"""
+    file_exists = os.path.exists(TRADE_LOG_FILE)
+    with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
+        # 如果是新檔案，寫入標題
+        if not file_exists:
+            f.write("timestamp,action,price,quantity,balance_usd,reason\n")
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{now},{action},{price},{qty},{balance_usd},{reason}\n"
+        f.write(line)
+
+# ─────────────────────────────────────────
+# 7. Coinbase API 交易執行
 # ─────────────────────────────────────────
 def get_client():
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
@@ -362,6 +392,16 @@ def run_auto_trading(product_id: str = "BTC-USD", interval_seconds: int = 3600):
     base_currency = product_id.split("-")[0]  # e.g., BTC
     quote_currency = product_id.split("-")[1] # e.g., USD
 
+    # 初始化餘額
+    if DRY_RUN:
+        v_state = load_virtual_state()
+        usd_bal = v_state["usd"]
+        btc_bal = v_state["btc"]
+        print(f"載入模擬餘額: ${usd_bal} USD, {btc_bal} {base_currency}")
+    else:
+        usd_bal = get_balance(client, quote_currency)
+        btc_bal = get_balance(client, base_currency)
+
     # 用於追踪部分平倉狀態
     state = {"half_sold": False}
 
@@ -375,31 +415,58 @@ def run_auto_trading(product_id: str = "BTC-USD", interval_seconds: int = 3600):
             price = sig_data["price"]
             print(f"目前價格: ${price} | 訊號: {signal} ({sig_data['reason']})")
 
+            # 更新當前實際/模擬餘額
+            if not DRY_RUN:
+                usd_bal = get_balance(client, quote_currency)
+                btc_bal = get_balance(client, base_currency)
+
             if signal == "BUY_ALL" or signal == "REBUY":
-                usd_balance = get_balance(client, quote_currency)
-                if usd_balance > 10:  # 最小買入金額
-                    print(f"偵測到買入訊號，餘額: ${usd_balance}")
-                    execute_market_buy(client, product_id, usd_balance)
-                    state["half_sold"] = False
+                if usd_bal > 10:  # 最小買入金額
+                    print(f"偵測到買入訊號，餘額: ${usd_bal}")
+                    order = execute_market_buy(client, product_id, usd_bal)
+                    if order:
+                        qty_bought = (usd_bal * (1 - FEE_RATE)) / price
+                        if DRY_RUN:
+                            btc_bal += qty_bought
+                            usd_bal = 0.0
+                            save_virtual_state(usd_bal, btc_bal)
+                        
+                        append_to_log("BUY", price, round(qty_bought, 6), round(usd_bal, 2), sig_data["reason"])
+                        state["half_sold"] = False
                 else:
-                    print(f"現金不足 (${usd_balance})，無法執行買入")
+                    print(f"現金不足 (${usd_bal})，無法執行買入")
 
             elif signal == "SELL_ALL":
-                btc_balance = get_balance(client, base_currency)
-                if btc_balance > 0.0001:  # 最小賣出量
-                    print(f"偵測到賣出訊號，持倉: {btc_balance} {base_currency}")
-                    execute_market_sell(client, product_id, btc_balance)
-                    state["half_sold"] = False
+                if btc_bal > 0.0001:  # 最小賣出量
+                    print(f"偵測到賣出訊號，持倉: {btc_bal} {base_currency}")
+                    order = execute_market_sell(client, product_id, btc_bal)
+                    if order:
+                        revenue = btc_bal * price * (1 - FEE_RATE)
+                        if DRY_RUN:
+                            usd_bal += revenue
+                            btc_bal = 0.0
+                            save_virtual_state(usd_bal, btc_bal)
+                        
+                        append_to_log("SELL_ALL", price, round(btc_bal, 6), round(usd_bal, 2), sig_data["reason"])
+                        state["half_sold"] = False
                 else:
                     print(f"無持倉，無需賣出")
 
             elif signal == "SELL_HALF":
                 if not state["half_sold"]:
-                    btc_balance = get_balance(client, base_currency)
-                    if btc_balance > 0.0001:
-                        print(f"偵測到部分賣出訊號，賣出一半持倉: {btc_balance/2}")
-                        execute_market_sell(client, product_id, btc_balance / 2)
-                        state["half_sold"] = True
+                    if btc_bal > 0.0001:
+                        sell_qty = btc_bal / 2
+                        print(f"偵測到部分賣出訊號，賣出一半持倉: {sell_qty}")
+                        order = execute_market_sell(client, product_id, sell_qty)
+                        if order:
+                            revenue = sell_qty * price * (1 - FEE_RATE)
+                            if DRY_RUN:
+                                usd_bal += revenue
+                                btc_bal -= sell_qty
+                                save_virtual_state(usd_bal, btc_bal)
+                            
+                            append_to_log("SELL_HALF", price, round(sell_qty, 6), round(usd_bal, 2), sig_data["reason"])
+                            state["half_sold"] = True
                 else:
                     print("先前已執行過部分賣出，略過")
 
