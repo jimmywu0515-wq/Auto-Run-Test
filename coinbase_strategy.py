@@ -21,7 +21,7 @@ Coinbase 自動交易策略 - EMA 黃金交叉 + RSI + MACD
 
   再買回條件（部分倉位因C被賣出後）：
     - EMA20 & EMA50 仍向上（slope > 0）
-    - 價格觸及 EMA50 並出現反彈（當日收盤 > EMA50）
+    - 價格重新站回 EMA20 以上 或 觸及 EMA50 出現反彈
     - RSI < 70, MACD histogram > 0
 """
 
@@ -212,8 +212,9 @@ def run_backtest(df: pd.DataFrame) -> dict:
             buy(i, price, "黃金交叉+RSI+MACD", frac=1.0)
 
         # ── 再買回（半倉賣出後，反彈條件）─────
-        if half_sold and both_up and price >= ema_l and rsi < 70 and hist > 0:
-            buy(i, price, "長線反彈再買回", frac=1.0)  # 用剩餘現金買回
+        rebuy_signal = half_sold and both_up and (price >= ema_s or price >= ema_l) and rsi < 70 and hist > 0
+        if rebuy_signal:
+            buy(i, price, "站回均線再買回", frac=1.0)  # 用剩餘現金買回
 
     # 最後收盤平倉
     if holdings > 1e-8:
@@ -276,9 +277,9 @@ def get_live_signal(product_id: str = "BTC-USD") -> dict:
     elif price < ema_s * (1 - HALF_SELL_THRESHOLD):
         signal = "SELL_HALF"
         reason.append(f"價格跌破短線{HALF_SELL_THRESHOLD*100:.0f}%")
-    elif both_up and price >= ema_l and rsi < 70 and hist > 0:
+    elif both_up and (price >= ema_s or price >= ema_l) and rsi < 70 and hist > 0:
         signal = "REBUY"
-        reason.append("長線反彈再買回")
+        reason.append("重新站回均線再買回")
 
     return {
         "timestamp": str(latest["date"]),
