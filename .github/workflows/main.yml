@@ -1,0 +1,38 @@
+name: Trading Bot CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run Backtest Sanity Check
+      env:
+        COINBASE_API_KEY: ${{ secrets.COINBASE_API_KEY }}
+        COINBASE_API_SECRET: ${{ secrets.COINBASE_API_SECRET }}
+        DRY_RUN: "True"
+      run: |
+        if [ -z "${{ secrets.COINBASE_API_KEY }}" ]; then
+          echo "WARNING: COINBASE_API_KEY is not set. Skipping backtest sanity check."
+          echo "Please set COINBASE_API_KEY in GitHub Repository Secrets."
+          exit 0
+        fi
+        # 執行 7 天的快速回測，確保代碼邏輯在雲端環境正常
+        python coinbase_strategy.py 1 7
