@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  autotrade:
+    build: .
+    volumes:
+      - ./.env:/app/.env
+      - ./virtual_state.json:/app/virtual_state.json
+      - ./trade_log.csv:/app/trade_log.csv
+    # 預設執行指令，可以在執行時覆蓋
+    command: python coinbase_strategy.py 1 300

@@ -3,3 +3,7 @@ __pycache__/
 *.csv
 .ipynb_checkpoints/
 *.log
+venv/
+virtual_state.json
+trade_log.csv
+api_info.txt

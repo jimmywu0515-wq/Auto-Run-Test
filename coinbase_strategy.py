@@ -33,20 +33,31 @@ import json
 import os
 import time
 from dotenv import load_dotenv
+import sys
 from coinbase.rest import RESTClient
 
 # 載入環境變數
 load_dotenv()
+
+# RL 相關匯入
+try:
+    from stable_baselines3 import PPO
+    RL_AVAILABLE = True
+except ImportError:
+    RL_AVAILABLE = False
 
 COINBASE_API_KEY = os.getenv("COINBASE_API_KEY")
 COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET")
 DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
 
 # ─────────────────────────────────────────
-# 1. 參數
+# 1. 參數 (進場 20/50, 退場 5/10)
 # ─────────────────────────────────────────
-SHORT_EMA   = 20
-LONG_EMA    = 50
+ENTRY_SHORT = 20
+ENTRY_LONG  = 50
+EXIT_SHORT  = 5
+EXIT_LONG   = 10
+
 RSI_PERIOD  = 14
 MACD_FAST   = 12
 MACD_SLOW   = 26
@@ -64,24 +75,60 @@ TRADE_LOG_FILE     = "trade_log.csv"
 # ─────────────────────────────────────────
 def fetch_coinbase_candles(product_id: str = "BTC-USD",
                             granularity: str = "ONE_DAY",
-                            days: int = 300) -> pd.DataFrame:
+                            days: int = 300,
+                            start_date: str = None) -> pd.DataFrame:
     """
     從 Coinbase Advanced Trade API 取得 K 線資料
-    不需要 API Key 即可讀取公開市場資料
+    支援分段抓取長時段資料
     """
-    end_ts   = int(datetime.utcnow().timestamp())
-    start_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    now_ts = int(datetime.utcnow().timestamp())
+    
+    if start_date:
+        try:
+            dt = datetime.strptime(start_date, "%Y-%m-%d")
+            requested_start_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            print(f"日期格式錯誤 ({start_date})，改用天數設定: {days}")
+            requested_start_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+    else:
+        requested_start_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
-    url = (f"https://api.coinbase.com/api/v3/brokerage/market/products/"
-           f"{product_id}/candles"
-           f"?start={start_ts}&end={end_ts}&granularity={granularity}")
+    all_data = []
+    current_end = now_ts
+    
+    # Coinbase API 限制單次約 300 根 K 線 (對 ONE_DAY 來說約 300 天)
+    # 我們分段抓取，每次抓 300 天，直到覆蓋到 requested_start_ts
+    chunk_seconds = 300 * 24 * 3600 # 300 天
+    
+    while current_end > requested_start_ts:
+        current_start = max(requested_start_ts, current_end - chunk_seconds)
+        
+        url = (f"https://api.coinbase.com/api/v3/brokerage/market/products/"
+               f"{product_id}/candles"
+               f"?start={current_start}&end={current_end}&granularity={granularity}")
 
-    headers = {"Content-Type": "application/json"}
-    resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
-    data = resp.json().get("candles", [])
+        headers = {"Content-Type": "application/json"}
+        resp = requests.get(url, headers=headers, timeout=60)
+        
+        if resp.status_code != 200:
+            print(f"抓取資料失敗 ({current_start} to {current_end}): {resp.text}")
+            break
+            
+        data = resp.json().get("candles", [])
+        if not data:
+            break
+            
+        all_data.extend(data)
+        # 更新下一次的結束時間為本次的最早時間 - 1
+        current_end = current_start - 1
+        
+        # 避免太頻繁呼叫
+        time.sleep(0.5)
 
-    df = pd.DataFrame(data, columns=["start", "low", "high", "open", "close", "volume"])
+    if not all_data:
+        raise ValueError("無法取得任何歷史資料，請檢查網路或日期設定。")
+
+    df = pd.DataFrame(all_data, columns=["start", "low", "high", "open", "close", "volume"])
     df["date"]  = pd.to_datetime(df["start"].astype(int), unit="s")
     df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
     df = df.sort_values("date").reset_index(drop=True)
@@ -110,21 +157,33 @@ def calc_macd(series: pd.Series, fast=12, slow=26, signal=9):
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema_short"] = calc_ema(df["close"], SHORT_EMA)
-    df["ema_long"]  = calc_ema(df["close"], LONG_EMA)
-    df["rsi"]       = calc_rsi(df["close"], RSI_PERIOD)
+    # 進場指標
+    df["ema_entry_s"] = calc_ema(df["close"], ENTRY_SHORT)
+    df["ema_entry_l"] = calc_ema(df["close"], ENTRY_LONG)
+    # 退場指標
+    df["ema_exit_s"]  = calc_ema(df["close"], EXIT_SHORT)
+    df["ema_exit_l"]  = calc_ema(df["close"], EXIT_LONG)
+    
+    # 額外指標 (用於其他策略比較)
+    df["ma5"]  = df["close"].rolling(window=5).mean()
+    df["ma10"] = df["close"].rolling(window=10).mean()
+    
+    df["rsi"] = calc_rsi(df["close"], RSI_PERIOD)
     df["macd"], df["macd_signal"], df["macd_hist"] = calc_macd(
         df["close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
-    # EMA 斜率（正 = 向上）
-    df["ema_short_slope"] = df["ema_short"].diff()
-    df["ema_long_slope"]  = df["ema_long"].diff()
-
-    # 黃金/死亡交叉
-    df["golden_cross"] = (df["ema_short"] > df["ema_long"]) & \
-                         (df["ema_short"].shift(1) <= df["ema_long"].shift(1))
-    df["death_cross"]  = (df["ema_short"] < df["ema_long"]) & \
-                         (df["ema_short"].shift(1) >= df["ema_long"].shift(1))
+    # 進場交叉 (Dual EMA)
+    df["entry_golden_cross"] = (df["ema_entry_s"] > df["ema_entry_l"]) & \
+                               (df["ema_entry_s"].shift(1) <= df["ema_entry_l"].shift(1))
+    
+    # 退場交叉 (Dual EMA)
+    df["exit_death_cross"]   = (df["ema_exit_s"] < df["ema_exit_l"]) & \
+                               (df["ema_exit_s"].shift(1) >= df["ema_exit_l"].shift(1))
+    
+    # 斜率用於再買回判斷
+    df["ema_entry_s_slope"] = df["ema_entry_s"].diff()
+    df["ema_entry_l_slope"] = df["ema_entry_l"].diff()
+    
     return df
 
 # ─────────────────────────────────────────
@@ -176,8 +235,10 @@ def run_backtest(df: pd.DataFrame) -> dict:
     for i in range(1, len(df)):
         row   = df.loc[i]
         price = row["close"]
-        ema_s = row["ema_short"]
-        ema_l = row["ema_long"]
+        ema_entry_s = row["ema_entry_s"]
+        ema_entry_l = row["ema_entry_l"]
+        ema_exit_s  = row["ema_exit_s"]
+        ema_exit_l  = row["ema_exit_l"]
         rsi   = row["rsi"]
         hist  = row["macd_hist"]
 
@@ -185,36 +246,36 @@ def run_backtest(df: pd.DataFrame) -> dict:
         equity_curve.append({"date": str(row["date"].date()), "equity": round(equity, 2),
                               "price": round(price, 2)})
 
-        both_up = row["ema_short_slope"] > 0 and row["ema_long_slope"] > 0
+        both_entry_up = row["ema_entry_s_slope"] > 0 and row["ema_entry_l_slope"] > 0
 
-        # ── 賣出邏輯（優先）──────────────────────
+        # ── 賣出邏輯 (使用 5/10 退場訊號) ──────────────────────
         if holdings > 1e-8:
-            # A: 死亡交叉 → 全賣
-            if row["death_cross"]:
-                sell(i, price, "死亡交叉", frac=1.0)
+            # A: 5/10 死亡交叉 → 全賣
+            if row["exit_death_cross"]:
+                sell(i, price, "5/10 死亡交叉 (快退)", frac=1.0)
                 half_sold = False
                 continue
 
-            # B: 跌破長線 3% → 全賣
-            if price < ema_l * (1 - FULL_SELL_THRESHOLD):
-                sell(i, price, f"跌破長線-{int(FULL_SELL_THRESHOLD*100)}%", frac=1.0)
+            # B: 跌破 10 日線 3% → 全賣 (硬止損)
+            if price < ema_exit_l * (1 - FULL_SELL_THRESHOLD):
+                sell(i, price, f"跌破 10 日線-{int(FULL_SELL_THRESHOLD*100)}%", frac=1.0)
                 half_sold = False
                 continue
 
-            # C: 跌破短線 3% → 賣一半（若未執行過）
-            if price < ema_s * (1 - HALF_SELL_THRESHOLD) and not half_sold:
-                sell(i, price, f"跌破短線-{int(HALF_SELL_THRESHOLD*100)}%", frac=0.5)
+            # C: 跌破 5 日線 3% → 賣一半
+            if price < ema_exit_s * (1 - HALF_SELL_THRESHOLD) and not half_sold:
+                sell(i, price, f"跌破 5 日線-{int(HALF_SELL_THRESHOLD*100)}%", frac=0.5)
 
-        # ── 買入邏輯 ────────────────────────────
-        buy_signal = (row["golden_cross"] and rsi < 70 and hist > 0)
+        # ── 買入邏輯 (使用 20/50 進場訊號) ────────────────────────────
+        buy_signal = (row["entry_golden_cross"] and rsi < 70 and hist > 0)
 
         if buy_signal and holdings < 1e-8:
-            buy(i, price, "黃金交叉+RSI+MACD", frac=1.0)
+            buy(i, price, "20/50 黃金交叉 (強進)", frac=1.0)
 
-        # ── 再買回（半倉賣出後，反彈條件）─────
-        rebuy_signal = half_sold and both_up and (price >= ema_s or price >= ema_l) and rsi < 70 and hist > 0
+        # ── 再買回（半倉賣出後，反彈條件，參考進場均線）─────
+        rebuy_signal = half_sold and both_entry_up and (price >= ema_entry_s) and rsi < 70 and hist > 0
         if rebuy_signal:
-            buy(i, price, "站回均線再買回", frac=1.0)  # 用剩餘現金買回
+            buy(i, price, "站回 20 日線再買回", frac=1.0)
 
     # 最後收盤平倉
     if holdings > 1e-8:
@@ -223,8 +284,12 @@ def run_backtest(df: pd.DataFrame) -> dict:
 
     final_equity = cash
     total_return = (final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
-    trades_df    = pd.DataFrame(trades)
-    buy_hold     = (df.iloc[-1]["close"] / df.iloc[LONG_EMA]["close"] - 1) * 100
+    
+    # 計算 Buy & Hold：從策略開始交易的那一點（LONG_EMA 之後）到最後
+    # 這樣對比才公平，因為策略需要熱身時間
+    start_price = df.iloc[0]["close"]
+    end_price   = df.iloc[-1]["close"]
+    buy_hold     = (end_price / start_price - 1) * 100
 
     # 最大回撤
     eq_vals = [e["equity"] for e in equity_curve]
@@ -234,10 +299,12 @@ def run_backtest(df: pd.DataFrame) -> dict:
         dd = (peak - v) / peak
         if dd > max_dd: max_dd = dd
 
-    win_trades = sum(1 for t in trades if "SELL" in t["action"])
     total_fees = sum(t["fee"] for t in trades)
 
     return {
+        "strategy_name": "Dual EMA (20/50 + 5/10)",
+        "start_date": str(df.iloc[0]["date"].date()),
+        "end_date": str(df.iloc[-1]["date"].date()),
         "final_equity": round(final_equity, 2),
         "total_return_pct": round(total_return, 2),
         "buy_hold_return_pct": round(buy_hold, 2),
@@ -246,40 +313,329 @@ def run_backtest(df: pd.DataFrame) -> dict:
         "total_fees_paid": round(total_fees, 2),
         "trades": trades,
         "equity_curve": equity_curve,
-        "df": df
     }
 
-def get_live_signal(product_id: str = "BTC-USD") -> dict:
+def run_ma_cross_backtest(df: pd.DataFrame, buffer_pct: float = 0.01) -> dict:
+    """
+    實作 5MA/10MA 交叉策略 (來自 Sideproject)
+    - 5MA > 10MA: 買入
+    - 價格 < 5MA * (1-buffer): 賣出 50%
+    - 價格 < 10MA * (1-buffer): 賣出 100%
+    """
+    df = df.dropna().reset_index(drop=True)
+    cash = float(INITIAL_CAPITAL)
+    holdings = 0.0
+    trades = []
+    equity_curve = []
+
+    for i in range(len(df)):
+        row = df.loc[i]
+        price = row["close"]
+        m5 = row["ma5"]
+        m10 = row["ma10"]
+
+        # Buy Signal
+        if m5 > m10 and cash > 1:
+            fee = cash * FEE_RATE
+            qty = (cash - fee) / price
+            holdings += qty
+            cash = 0
+            trades.append({"action": "BUY", "price": price})
+
+        # Sell Signal
+        elif holdings > 1e-8 and price < m5 * (1 - buffer_pct):
+            if price < m10 * (1 - buffer_pct):
+                # 全賣
+                rev = holdings * price * (1 - FEE_RATE)
+                cash += rev
+                holdings = 0
+                trades.append({"action": "SELL_ALL", "price": price})
+            else:
+                # 賣一半
+                qty_half = holdings * 0.5
+                rev = qty_half * price * (1 - FEE_RATE)
+                cash += rev
+                holdings -= qty_half
+                trades.append({"action": "SELL_HALF", "price": price})
+
+        equity = cash + holdings * price
+        equity_curve.append(equity)
+
+    final_equity = cash + holdings * df.iloc[-1]["close"]
+    total_return = (final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+    
+    # 計算最大回撤
+    peak, max_dd = INITIAL_CAPITAL, 0.0
+    for v in equity_curve:
+        if v > peak: peak = v
+        dd = (peak - v) / peak
+        if dd > max_dd: max_dd = dd
+
+    return {
+        "strategy_name": "5/10 MA Cross (User)",
+        "final_equity": round(final_equity, 2),
+        "total_return_pct": round(total_return, 2),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "total_trades": len(trades)
+    }
+
+def run_grid_backtest(df: pd.DataFrame, grid_count: int = 10, width_pct: float = 0.05) -> dict:
+    """
+    實作靜態網格交易策略 (來自 Sideproject)
+    """
+    df = df.dropna().reset_index(drop=True)
+    cash = float(INITIAL_CAPITAL)
+    holdings = 0.0
+    trades_count = 0
+    
+    current_price = df.iloc[0]["close"]
+    center = current_price
+    upper = center * (1 + width_pct)
+    lower = center * (1 - width_pct)
+    grid_step = (upper - lower) / grid_count
+    
+    levels = [lower + i * grid_step for i in range(grid_count + 1)]
+    equity_curve = []
+
+    for i in range(1, len(df)):
+        row = df.loc[i]
+        high = row["high"]
+        low = row["low"]
+        close = row["close"]
+        
+        # 模擬網格觸發 (簡化版)
+        for lv in levels:
+            # 價格下穿過網格線 -> 買入 (假設每格投入 10% 資金)
+            if current_price > lv and low <= lv:
+                buy_amt = INITIAL_CAPITAL / grid_count
+                if cash >= buy_amt:
+                    qty = (buy_amt * (1 - FEE_RATE)) / lv
+                    holdings += qty
+                    cash -= buy_amt
+                    trades_count += 1
+            
+            # 價格上穿過網格線 -> 賣出
+            if current_price < lv and high >= lv:
+                if holdings > 0:
+                    sell_qty = holdings / grid_count # 簡化：賣出總持倉的 1/N
+                    cash += sell_qty * lv * (1 - FEE_RATE)
+                    holdings -= sell_qty
+                    trades_count += 1
+        
+        current_price = close
+        equity = cash + holdings * close
+        equity_curve.append(equity)
+
+    final_equity = cash + holdings * df.iloc[-1]["close"]
+    total_return = (final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+
+    peak, max_dd = INITIAL_CAPITAL, 0.0
+    for v in equity_curve:
+        if v > peak: peak = v
+        dd = (peak - v) / peak
+        if dd > max_dd: max_dd = dd
+
+    return {
+        "strategy_name": "Static Grid (10 grids)",
+        "final_equity": round(final_equity, 2),
+        "total_return_pct": round(total_return, 2),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "total_trades": trades_count
+    }
+
+# ─────────────────────────────────────────
+# 5. 強化學習策略 (Artemis V2 RL)
+# ─────────────────────────────────────────
+
+def compute_rl_features(df: pd.DataFrame) -> np.ndarray:
+    """
+    實作 Artemis V2 的 18 種特徵計算
+    """
+    prices = df['close'].values.astype(np.float32)
+    highs = df['high'].values.astype(np.float32)
+    lows = df['low'].values.astype(np.float32)
+    volumes = df['volume'].values.astype(np.float32)
+    
+    # 1. Log Returns
+    log_ret = np.log(prices[1:] / (prices[:-1] + 1e-9))
+    log_ret = np.concatenate([[0.0], log_ret])
+    
+    # 2. RSI (Normalized to [-1, 1])
+    def get_rsi(p, period=14):
+        delta = np.diff(p, prepend=p[0])
+        gain = np.where(delta > 0, delta, 0.0)
+        loss = np.where(delta < 0, -delta, 0.0)
+        avg_gain = pd.Series(gain).ewm(span=period, adjust=False).mean().values
+        avg_loss = pd.Series(loss).ewm(span=period, adjust=False).mean().values
+        rs = np.where(avg_loss == 0, 100.0, avg_gain / (avg_loss + 1e-9))
+        rsi = 100 - (100 / (1 + rs))
+        return (rsi - 50) / 50
+
+    # 3. MACD
+    def get_macd(p):
+        s = pd.Series(p)
+        f = s.ewm(span=12, adjust=False).mean().values
+        sl = s.ewm(span=26, adjust=False).mean().values
+        m = f - sl
+        sig = pd.Series(m).ewm(span=9, adjust=False).mean().values
+        h = m - sig
+        return m / (p + 1e-9), sig / (p + 1e-9), h / (p + 1e-9)
+
+    # 4. Bollinger
+    def get_b(p):
+        s = pd.Series(p)
+        mid = s.rolling(20, min_periods=1).mean().values
+        std = s.rolling(20, min_periods=1).std(ddof=0).fillna(0).values
+        u, l = mid + 2*std, mid - 2*std
+        b = (p - l) / (u - l + 1e-9)
+        return np.clip(b * 2 - 1, -1, 1)
+
+    # 5. ATR
+    def get_atr(h, l, c):
+        tr = np.maximum(h - l, np.maximum(np.abs(h - np.roll(c, 1)), np.abs(l - np.roll(c, 1))))
+        tr[0] = h[0] - l[0]
+        a = pd.Series(tr).ewm(span=14, adjust=False).mean().values
+        return a / (c + 1e-9)
+
+    rsi = get_rsi(prices)
+    m, ms, mh = get_macd(prices)
+    bb = get_b(prices)
+    atr = get_atr(highs, lows, prices)
+    vol20 = pd.Series(log_ret).rolling(20, min_periods=1).std(ddof=0).values.astype(np.float32)
+    mom5 = np.concatenate([[0.0]*5, (prices[5:] - prices[:-5]) / (prices[:-5] + 1e-9)])
+    mom10 = np.concatenate([[0.0]*10, (prices[10:] - prices[:-10]) / (prices[:-10] + 1e-9)])
+    v_avg = pd.Series(volumes).rolling(20, min_periods=1).mean()
+    v_std = pd.Series(volumes).rolling(20, min_periods=1).std(ddof=0) + 1e-9
+    vz = ((volumes - v_avg) / v_std).values.astype(np.float32)
+
+    # 組合 18 維特徵 (簡化版，省略部分動態狀態以適配靜態回測)
+    obs_batch = []
+    for t in range(len(df)):
+        obs = [
+            log_ret[t],
+            log_ret[max(t-1, 0)],
+            log_ret[max(t-2, 0)],
+            rsi[t],
+            m[t],
+            ms[t],
+            mh[t],
+            bb[t],
+            atr[t],
+            0.0, # Current Position (Mock)
+            0.0, # Unrealized PnL (Mock)
+            np.clip(mom5[t], -0.2, 0.2) / 0.2,
+            np.clip(mom10[t], -0.3, 0.3) / 0.3,
+            np.clip(vz[t], -3, 3) / 3,
+            np.clip(vol20[t] * 100, 0, 5) / 5,
+            0.0, # Steps in position
+            0.0, # Portfolio growth
+            0.0  # Max drawdown
+        ]
+        obs_batch.append(obs)
+    return np.array(obs_batch, dtype=np.float32)
+
+def run_rl_backtest(df: pd.DataFrame, model_path: str = "models/artemis_v2.zip") -> dict:
+    """
+    執行 Artemis V2 RL 模型的模擬回測
+    """
+    if not RL_AVAILABLE or not os.path.exists(model_path):
+        return {"strategy_name": "Artemis V2 (RL)", "total_return_pct": 0.0, "max_drawdown_pct": 0.0, "total_trades": 0, "error": "Model or SB3 not found"}
+
+    try:
+        model = PPO.load(model_path)
+    except Exception as e:
+        return {"strategy_name": "Artemis V2 (RL)", "total_return_pct": 0.0, "max_drawdown_pct": 0.0, "total_trades": 0, "error": str(e)}
+
+    obs_matrix = compute_rl_features(df)
+    cash = float(INITIAL_CAPITAL)
+    holdings = 0.0
+    equity_curve = []
+    trades_count = 0
+    current_pos_size = 0.0 # -1 to 1
+
+    for i in range(len(df)):
+        price = df.iloc[i]["close"]
+        obs = obs_matrix[i]
+        
+        # 預測動作
+        action, _ = model.predict(obs, deterministic=True)
+        direction = float(np.clip(action[0], -1, 1))
+        size_frac  = float(np.clip(action[1], 0, 1))
+        target_pos_size = direction * size_frac
+        
+        # 執行交易 (簡化：目標倉位法)
+        if abs(target_pos_size - current_pos_size) > 0.1:
+            # 計算買賣量
+            target_usd = target_pos_size * (cash + holdings * price)
+            diff_usd = target_usd - (holdings * price)
+            
+            if diff_usd > 5 and cash > diff_usd: # BUY
+                fee = diff_usd * FEE_RATE
+                qty = (diff_usd - fee) / price
+                holdings += qty
+                cash -= diff_usd
+                trades_count += 1
+            elif diff_usd < -5 and holdings > 0: # SELL
+                sell_qty = abs(diff_usd) / price
+                if sell_qty > holdings: sell_qty = holdings
+                cash += sell_qty * price * (1 - FEE_RATE)
+                holdings -= sell_qty
+                trades_count += 1
+            
+            current_pos_size = target_pos_size
+
+        equity = cash + holdings * price
+        equity_curve.append(equity)
+
+    final_equity = cash + holdings * df.iloc[-1]["close"]
+    total_return = (final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
+    
+    max_dd = 0.0
+    peak = INITIAL_CAPITAL
+    for v in equity_curve:
+        if v > peak: peak = v
+        dd = (peak - v) / peak
+        if dd > max_dd: max_dd = dd
+
+    return {
+        "strategy_name": "Artemis V2 (RL)",
+        "final_equity": round(final_equity, 2),
+        "total_return_pct": round(total_return, 2),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "total_trades": trades_count
+    }
     """取得即時交易訊號"""
     df     = fetch_coinbase_candles(product_id, days=200)
     df     = add_indicators(df).dropna().reset_index(drop=True)
     latest = df.iloc[-1]
 
     price  = latest["close"]
-    ema_s  = latest["ema_short"]
-    ema_l  = latest["ema_long"]
+    ema_entry_s = latest["ema_entry_s"]
+    ema_entry_l = latest["ema_entry_l"]
+    ema_exit_s  = latest["ema_exit_s"]
+    ema_exit_l  = latest["ema_exit_l"]
     rsi    = latest["rsi"]
     hist   = latest["macd_hist"]
-    both_up = latest["ema_short_slope"] > 0 and latest["ema_long_slope"] > 0
+    both_entry_up = latest["ema_entry_s_slope"] > 0 and latest["ema_entry_l_slope"] > 0
 
     signal = "HOLD"
     reason = []
 
-    if latest["golden_cross"] and rsi < 70 and hist > 0:
+    if latest["entry_golden_cross"] and rsi < 70 and hist > 0:
         signal = "BUY_ALL"
-        reason.append(f"黃金交叉: EMA{SHORT_EMA}穿越EMA{LONG_EMA}")
-    elif latest["death_cross"]:
+        reason.append(f"進場訊號: EMA{ENTRY_SHORT} 向上打穿 EMA{ENTRY_LONG}")
+    elif latest["exit_death_cross"]:
         signal = "SELL_ALL"
-        reason.append("死亡交叉")
-    elif price < ema_l * (1 - FULL_SELL_THRESHOLD):
+        reason.append(f"退場訊號: EMA{EXIT_SHORT} 向下打穿 EMA{EXIT_LONG}")
+    elif price < ema_exit_l * (1 - FULL_SELL_THRESHOLD):
         signal = "SELL_ALL"
-        reason.append(f"價格跌破長線{FULL_SELL_THRESHOLD*100:.0f}%")
-    elif price < ema_s * (1 - HALF_SELL_THRESHOLD):
+        reason.append(f"硬止損: 價格跌破 {EXIT_LONG} 日線 {FULL_SELL_THRESHOLD*100:.0f}%")
+    elif price < ema_exit_s * (1 - HALF_SELL_THRESHOLD):
         signal = "SELL_HALF"
-        reason.append(f"價格跌破短線{HALF_SELL_THRESHOLD*100:.0f}%")
-    elif both_up and (price >= ema_s or price >= ema_l) and rsi < 70 and hist > 0:
+        reason.append(f"部分止損: 價格跌破 {EXIT_SHORT} 日線 {HALF_SELL_THRESHOLD*100:.0f}%")
+    elif both_entry_up and (price >= ema_entry_s) and rsi < 70 and hist > 0:
         signal = "REBUY"
-        reason.append("重新站回均線再買回")
+        reason.append("重新站回進場短均線再買回")
 
     return {
         "timestamp": str(latest["date"]),
@@ -484,29 +840,95 @@ def run_auto_trading(product_id: str = "BTC-USD", interval_seconds: int = 3600):
 # 8. 執行回測與展示報告
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    print("=" * 55)
-    print("  Coinbase 自動交易系統 (EMA+RSI+MACD)")
-    print("=" * 55)
-    print("  1. 執行歷史回測")
-    print("  2. 啟動自動交易 (1 小時檢查一次)")
-    print("  3. 啟動自動交易 (自訂頻率)")
-    print("=" * 55)
-    
-    choice = input("請選擇功能 (1/2/3): ").strip()
+    # 支援命令列參數 (例如: python coinbase_strategy.py 1)
+    if len(sys.argv) > 1:
+        choice = sys.argv[1]
+    else:
+        print("=" * 55)
+        print("  Coinbase 自動交易系統 (EMA+RSI+MACD)")
+        print("=" * 55)
+        print("  1. 執行歷史回測")
+        print("  2. 啟動自動交易 (1 小時檢查一次)")
+        print("  3. 啟動自動交易 (自訂頻率)")
+        print("=" * 55)
+        try:
+            choice = input("請選擇功能 (1/2/3): ").strip()
+        except EOFError:
+            choice = ""
 
     if choice == "1":
-        print("\n[回測] 正在計算...")
-        df = fetch_coinbase_candles("BTC-USD", days=300)
-        result = run_backtest(df)
-        print(f"\n策略報酬率: {result['total_return_pct']:+.2f}% | 交易次數: {result['total_trades']}")
+        print("\n--- 回測設定 ---")
+        if len(sys.argv) > 2:
+            time_input = sys.argv[2]
+        else:
+            time_input = input("請輸入回測天數 (例如 300) 或 開始日期 (YYYY-MM-DD) [預設 300]: ").strip()
+        
+        if not time_input:
+            time_input = "300"
+            
+        print("[回測] 正在獲取資料並計算...")
+        
+        # 判斷是天數還是日期
+        if "-" in time_input:
+            df_raw = fetch_coinbase_candles("BTC-USD", start_date=time_input)
+        else:
+            try:
+                days = int(time_input)
+            except ValueError:
+                days = 300
+            df_raw = fetch_coinbase_candles("BTC-USD", days=days)
+            
+        # 跑所有策略
+        df_ind = add_indicators(df_raw)
+        res_dual = run_backtest(df_ind)
+        res_ma   = run_ma_cross_backtest(df_ind)
+        res_grid = run_grid_backtest(df_ind)
+        res_rl   = run_rl_backtest(df_ind)
+        
+        print("\n" + "="*60)
+        print(f"策略效能對比報告 ({res_dual['start_date']} 至 {res_dual['end_date']})")
+        print("="*60)
+        print(f"{'策略名稱':<25} | {'報酬率':<8} | {'最大回撤':<8} | {'交易次數':<4}")
+        print("-" * 60)
+        
+        def print_row(r):
+            name = r["strategy_name"]
+            if "error" in r:
+                print(f"{name:<25} | {'ERROR':<8} | {'---':<8} | {'---':<4}")
+                return
+            ret  = f"{r['total_return_pct']:+.2f}%"
+            dd   = f"{r['max_drawdown_pct']}%"
+            cnt  = r["total_trades"]
+            print(f"{name:<25} | {ret:<8} | {dd:<8} | {cnt:<4}")
+
+        print_row(res_dual)
+        print_row(res_ma)
+        print_row(res_grid)
+        print_row(res_rl)
+        
+        # B&H 參考
+        bh_ret = f"{res_dual['buy_hold_return_pct']:+.2f}%"
+        print(f"{'Buy & Hold (參考)':<25} | {bh_ret:<8} | {'N/A':<8} | {'0':<4}")
+        
+        print("-" * 60)
+        print(f"最終資產預覽 (Dual EMA): ${res_dual['final_equity']} USD")
+        print("="*60)
         print("[完成] 回測結束。")
 
     elif choice == "2":
         run_auto_trading("BTC-USD", interval_seconds=3600)
 
     elif choice == "3":
-        mins = input("輸入檢查頻率 (分鐘, 預設 60): ").strip()
-        mins = int(mins) if mins else 60
+        if len(sys.argv) > 2:
+            mins = sys.argv[2]
+        else:
+            mins = input("輸入檢查頻率 (分鐘, 預設 60): ").strip()
+        
+        try:
+            mins = int(mins) if mins else 60
+        except ValueError:
+            mins = 60
+            
         run_auto_trading("BTC-USD", interval_seconds=mins * 60)
         
     else:
