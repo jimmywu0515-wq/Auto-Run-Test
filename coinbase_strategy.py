@@ -16,8 +16,8 @@ Strategy Rules:
 
   Sell Conditions (In priority):
     A. EMA20 crosses below EMA50 (Death Cross) -> Sell All
-    B. Price drops below EMA50 × (1 - 3%)      -> Sell All
-    C. Price drops below EMA20 × (1 - 3%)      -> Sell 50%
+    B. Price drops below EMA50 * (1 - 3%)      -> Sell All
+    C. Price drops below EMA20 * (1 - 3%)      -> Sell 50%
 
   Re-entry Conditions (After partial sell from C):
     - EMA20 & EMA50 still upward (slope > 0)
@@ -76,7 +76,7 @@ MACD_SIGNAL = 9
 FEE_RATE    = 0.006   # Coinbase Taker fee 0.6% per side; Buy+Sell = 1.2%
 HALF_SELL_THRESHOLD  = 0.03   # Drop below short-term EMA by 3%
 FULL_SELL_THRESHOLD  = 0.03   # Drop below long-term EMA by 3%
-INITIAL_CAPITAL = 500      # 初始資金 (USD)
+INITIAL_CAPITAL = 500      # Initial Capital (USD)
 
 VIRTUAL_STATE_FILE = "virtual_state.json"
 TRADE_LOG_FILE     = "trade_log.csv"
@@ -168,14 +168,14 @@ def calc_macd(series: pd.Series, fast=12, slow=26, signal=9):
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # 進場指標
+    # Entry Indicators
     df["ema_entry_s"] = calc_ema(df["close"], ENTRY_SHORT)
     df["ema_entry_l"] = calc_ema(df["close"], ENTRY_LONG)
-    # 退場指標
+    # Exit Indicators
     df["ema_exit_s"]  = calc_ema(df["close"], EXIT_SHORT)
     df["ema_exit_l"]  = calc_ema(df["close"], EXIT_LONG)
     
-    # 額外指標 (用於其他策略比較)
+    # Extra Indicators (For strategy comparison)
     df["ma20"] = df["close"].rolling(window=20).mean()
     df["ma50"] = df["close"].rolling(window=50).mean()
     
@@ -183,11 +183,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd"], df["macd_signal"], df["macd_hist"] = calc_macd(
         df["close"], MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
-    # 進場交叉 (Dual EMA)
+    # Entry Crossovers (Dual EMA)
     df["entry_golden_cross"] = (df["ema_entry_s"] > df["ema_entry_l"]) & \
                                (df["ema_entry_s"].shift(1) <= df["ema_entry_l"].shift(1))
     
-    # 退場交叉 (Dual EMA)
+    # Exit Crossovers (Dual EMA)
     df["exit_death_cross"]   = (df["ema_exit_s"] < df["ema_exit_l"]) & \
                                (df["ema_exit_s"].shift(1) >= df["ema_exit_l"].shift(1))
     
@@ -202,12 +202,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────
 def run_backtest(df: pd.DataFrame) -> dict:
     """Execute Dual EMA strategy backtest"""
-    # 移除 redundant add_indicators, 因為外面已經做過了
+    # Redundant indicators already handled externally
 
     cash        = float(INITIAL_CAPITAL)
-    holdings    = 0.0        # 持有數量（BTC）
-    avg_cost    = 0.0        # 平均成本
-    half_sold   = False      # 是否已執行半賣
+    holdings    = 0.0        # BTC holdings
+    avg_cost    = 0.0        # Average cost
+    half_sold   = False      # Partial sell flag
     trades      = []
     equity_curve = []
 
@@ -268,9 +268,9 @@ def run_backtest(df: pd.DataFrame) -> dict:
                 half_sold = False
                 continue
 
-            # B: 跌破 10 日線 3% → 全賣 (硬止損)
+            # B: Drop below EMA10 * (1 - 3%) -> Sell All (Hard Stop Loss)
             if price < ema_exit_l * (1 - FULL_SELL_THRESHOLD):
-                sell(i, price, f"跌破 10 日線-{int(FULL_SELL_THRESHOLD*100)}%", frac=1.0)
+                sell(i, price, f"Below EMA10-{int(FULL_SELL_THRESHOLD*100)}%", frac=1.0)
                 half_sold = False
                 continue
 
@@ -352,13 +352,13 @@ def run_ma_cross_backtest(df: pd.DataFrame, buffer_pct: float = 0.01) -> dict:
         # Sell Signal
         elif holdings > 1e-8 and price < m20 * (1 - buffer_pct):
             if price < m50 * (1 - buffer_pct):
-                # 全賣
+                # Sell All
                 rev = holdings * price * (1 - FEE_RATE)
                 cash += rev
                 holdings = 0
                 trades.append({"action": "SELL_ALL", "price": price})
             else:
-                # 賣一半
+                # Sell Half
                 qty_half = holdings * 0.5
                 rev = qty_half * price * (1 - FEE_RATE)
                 cash += rev
@@ -371,7 +371,7 @@ def run_ma_cross_backtest(df: pd.DataFrame, buffer_pct: float = 0.01) -> dict:
     final_equity = cash + holdings * df.iloc[-1]["close"]
     total_return = (final_equity - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
     
-    # 計算最大回撤
+    # Calculate Max Drawdown
     peak, max_dd = INITIAL_CAPITAL, 0.0
     for v in equity_curve:
         if v > peak: peak = v
@@ -752,7 +752,7 @@ def get_live_signal(product_id: str):
         "macd_hist": round(hist, 4),
         "both_ema_up": bool(both_entry_up),
         "signal": signal,
-        "reason": ", ".join(reason) if reason else "無觸發條件"
+        "reason": ", ".join(reason) if reason else "No trigger"
     }
 
 # ─────────────────────────────────────────
@@ -801,7 +801,7 @@ def send_status_email(subject, body):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
-        # 這裡改用 SSL 繞過 macOS 憑證問題
+        # Use SSL context to bypass macOS certificate issues
         import ssl
         context = ssl._create_unverified_context()
         
@@ -818,7 +818,7 @@ def send_status_email(subject, body):
 # ─────────────────────────────────────────
 def get_client():
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
-        raise ValueError("請先在 .env 檔案中設定 COINBASE_API_KEY 與 COINBASE_API_SECRET")
+        raise ValueError("Please set COINBASE_API_KEY and COINBASE_API_SECRET in .env")
     return RESTClient(api_key=COINBASE_API_KEY, api_secret=COINBASE_API_SECRET)
 
 def get_balance(client, currency: str = "USD"):
@@ -839,7 +839,7 @@ def execute_market_buy(client, product_id: str, amount_usd: float):
         return {"order_id": "dry_run_buy"}
     
     try:
-        # quote_size 是以 USD 為單位的買入金額
+        # quote_size is the amount in USD
         order = client.market_order_buy(
             client_order_id=f"buy_{int(time.time())}",
             product_id=product_id,
@@ -858,7 +858,7 @@ def execute_market_sell(client, product_id: str, amount_btc: float):
         return {"order_id": "dry_run_sell"}
 
     try:
-        # base_size 是以 BTC 為單位的賣出數量
+        # base_size is the quantity in BTC
         order = client.market_order_sell(
             client_order_id=f"sell_{int(time.time())}",
             product_id=product_id,
@@ -871,7 +871,7 @@ def execute_market_sell(client, product_id: str, amount_btc: float):
         return None
 
 # ─────────────────────────────────────────
-# 7. 主程式：自動交易迴圈
+# 7. Main Loop: Auto Trading
 # ─────────────────────────────────────────
 def run_auto_trading(product_id: str = None, interval_seconds: int = 3600):
     """
@@ -916,7 +916,7 @@ def run_auto_trading(product_id: str = None, interval_seconds: int = 3600):
             email_body = f"Time: {now}\nPrice: ${price}\nSignal: {signal}\nReason: {sig_data['reason']}\nMode: {'DRY RUN' if DRY_RUN else 'REAL'}"
             send_status_email(email_subject, email_body)
 
-            # 更新當前實際/模擬餘額
+            # Update current real/virtual balances
             if not DRY_RUN:
                 usd_bal = get_balance(client, quote_currency)
                 btc_bal = get_balance(client, base_currency)
@@ -981,10 +981,10 @@ def run_auto_trading(product_id: str = None, interval_seconds: int = 3600):
         time.sleep(interval_seconds)
 
 # ─────────────────────────────────────────
-# 8. 執行回測與展示報告
+# 8. Execution & Reporting
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    # 支援命令列參數 (例如: python coinbase_strategy.py 1)
+    # Support command line args (e.g.: python coinbase_strategy.py 1)
     if len(sys.argv) > 1:
         choice = sys.argv[1]
     else:
@@ -1097,7 +1097,7 @@ if __name__ == "__main__":
                 try:
                     sig_data = get_rl_signal_tb(product_id)
                     signal, reason = sig_data["signal"], sig_data["reason"]
-                    print(f"[{datetime.now()}] 訊號: {signal} ({reason})")
+                    print(f"[{datetime.now()}] Signal: {signal} ({reason})")
                     
                     if signal == "BUY_ALL":
                         bal = get_balance(client, product_id.split("-")[1])
